@@ -15,6 +15,12 @@ import s3fs
 import pandas as pd
 import cv2
 from natsort import natsorted
+import glob
+import logging
+from shapely import geometry
+from shapely.geometry import Point, Polygon
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # extract_xarray_in_region
@@ -783,11 +789,17 @@ def get_matching_cycles(file_path, start_date_str, end_date_str):
         
     """
     
-    data = pd.read_csv(file_path)
-    
-    # Data cleaning
-    data = data.iloc[2:].reset_index(drop=True)
-    data.columns = ['cycle_number', 'start_time', 'end_time']
+    # Data cleaning: read every row without assuming a header, then identify
+    # the data rows by coercing the time columns to datetimes. Junk preamble
+    # lines and header rows (whose time cells do not parse) drop out, so the
+    # function accepts cycle calendars with OR without leading junk lines
+    # (ragged short junk rows are padded with NaN). The historic
+    # implementation unconditionally discarded the first two rows, which
+    # silently dropped the first two cycles on clean calendars.
+    data = pd.read_csv(
+        file_path, header=None,
+        names=['cycle_number', 'start_time', 'end_time'],
+    )
     data['cycle_number'] = data['cycle_number'].astype(str)
     data['start_time'] = pd.to_datetime(data['start_time'], errors='coerce')
     data['end_time'] = pd.to_datetime(data['end_time'], errors='coerce')
@@ -1099,4 +1111,415 @@ def make_movie_swot(image_folder, output_video, fps=3):
     cv2.destroyAllWindows()
 
     print(f"Video saved as '{output_video}'")
+    
+
+# =============================================================================
+# _parse_swot_filename
+# =============================================================================
+
+def _parse_swot_filename(filename, index_name="SSH"):
+    """
+    Extract (pass_number, end_date) from a SWOT-like NetCDF filename.
+
+    Two conventions are tried in order:
+
+    1. A regex matching names of the form
+       ``*_<index_name>_<cycle>_<pass>_<start><anything>_<end><anything>*.nc``
+       (covers the SWOT-OMIP pseudo-SWOT layout, e.g.
+       ``MODEL_GRID_L3_LR_SSH_011_532_20240215000000_20240225235929_v1.0.2.nc``).
+    2. The token-based fallback
+       ``*_<index_name>_<cycle>_<pass>_<start>_<end>*
+       (the pass number is the 2nd token after ``index_name``, the end date the
+       4th) — same tokens, kept for names the regex does not cover, e.g.
+       ``SWOT_L3_LR_SSH_Expert_532_011_20240215T..._20240217T....nc``.
+
+    Parameters
+    ------------
+    filename : str
+        Name (or path) of the file.
+    index_name : str, optional
+        Filename token identifying the data index, default "SSH".
+
+    Returns
+    ---------
+    (pass_number, end_date) : tuple(int, str) or None
+        pass_number as int, end_date as 'YYYYMMDD'. None when the name does
+        not follow either convention (unlike the historic parts.index() parsing,
+        which raised ValueError mid-scan).
+    """
+    match = re.search(
+        rf"_{re.escape(index_name)}_(\d+)_(\d+)_(\d{{8}})[^_]*_(\d{{8}})[^_]*",
+        filename,
+    )
+    if match:
+        return int(match.group(2)), match.group(4)[:8]
+    parts = filename.split("_")
+    try:
+        idx = parts.index(index_name)
+        return int(parts[idx + 2]), parts[idx + 4][:8]
+    except (ValueError, IndexError):
+        return None
+
+
+# =============================================================================
+# read_swot_ncfiles_local_list
+# =============================================================================
+
+def read_swot_ncfiles_local_list(folder, area, file_list, engine="h5netcdf"):
+    """
+    Load local NetCDF files and filter them based on the region of interest.
+    Same reader as read_swot_ncfiles_S3folder, but for a precomputed list of
+    local file paths (e.g. the output of find_listdata_local).
+
+    Parameters
+    -----------
+    folder : str
+        Local folder containing the NetCDF files (informational; files are
+        taken from file_list).
+    area : list
+        List with the boundaries of the region of interest [lon_min, lat_min, lon_max, lat_max].
+    file_list : list
+        List of file paths to read.
+    engine : str, optional
+        Engine for reading NetCDF files, default is "h5netcdf".
+
+    Returns
+    --------
+    datasets_dict : Dict
+        A dictionary of xarray datasets.
+    """
+    lon_min, lat_min, lon_max, lat_max = area
+
+    datasets_dict = {}
+    current_key = 0
+
+    for file in file_list:
+        try:
+            # Open the NetCDF file
+            with open(file, mode='rb') as fileObj:
+                ds = xr.open_dataset(fileObj, engine=engine)
+
+                # drop some variables
+                ds = ds.drop_vars(["i_num_line", "i_num_pixel"], errors="ignore")
+
+                # Check geographical filtering
+                if 'latitude' in ds and 'longitude' in ds:
+
+                    # Handle longitude wrapping
+                    if lon_min < lon_max:
+                        lon_selection = (ds['longitude'] >= lon_min) & (ds['longitude'] <= lon_max)
+                    else:
+                        lon_selection = ((ds['longitude'] >= lon_min) & (ds['longitude'] <= 360)) | (ds['longitude'] <= lon_max)
+
+                    lat_selection = (ds['latitude'] >= lat_min) & (ds['latitude'] <= lat_max)
+
+                    # Combine the selection masks
+                    selection = lat_selection & lon_selection
+
+                    # Check if selection is valid
+                    if selection.any():
+                        logger.info("%s included.", os.path.basename(file))
+                    else:
+                        ds.close()
+                        continue
+
+                    # Drop data outside the region
+                    ds = ds.where(selection, drop=True)
+
+                    # Check if the filtered dataset has valid data
+                    if ds['latitude'].size == 0 or ds['longitude'].size == 0:
+                        logger.info("File %s excluded: empty dataset after region filtering.",
+                                    os.path.basename(file))
+                        ds.close()
+                        continue
+
+                # Add the dataset to the dictionary if it passed all filters
+                datasets_dict[current_key] = ds
+                current_key += 1
+
+        except Exception as e:
+            logger.warning("Error processing file %s: %s", os.path.basename(file), e)
+            continue
+
+    return datasets_dict
+
+
+# =============================================================================
+# read_swot_ncfiles_S3folder_list
+# =============================================================================
+
+def read_swot_ncfiles_S3folder_list(s3_folder, endpoint_url, area, file_list, engine="h5netcdf"):
+    """
+    Load NetCDF files from S3 and filter them based on the region of interest.
+    Same reader as read_swot_ncfiles_S3folder, but for a precomputed list of S3
+    keys (e.g. the output of find_listdata) instead of listing s3_folder.
+
+    Parameters
+    -----------
+    s3_folder : str
+        Path to the S3 folder containing the NetCDF files (informational; files
+        are taken from file_list).
+    endpoint_url : str
+        URL of the S3 endpoint.
+    area : list
+        List with the boundaries of the region of interest [lon_min, lat_min, lon_max, lat_max].
+    file_list : list
+        List of S3 keys to read.
+    engine : str, optional
+        Engine for reading NetCDF files, default is "h5netcdf".
+
+    Returns
+    --------
+    datasets_dict : Dict
+        A dictionary of xarray datasets.
+    """
+    lon_min, lat_min, lon_max, lat_max = area
+
+    # Initialize S3 filesystem
+    fs = s3fs.S3FileSystem(anon=True, endpoint_url=endpoint_url)
+
+    datasets_dict = {}
+    current_key = 0
+
+    for file in file_list:
+        try:
+            # Open the NetCDF file
+            with fs.open(file, mode='rb') as fileObj:
+                ds = xr.open_dataset(fileObj, engine=engine)
+
+                # drop some variables
+                ds = ds.drop_vars(["i_num_line", "i_num_pixel"], errors="ignore")
+
+                # Check geographical filtering
+                if 'latitude' in ds and 'longitude' in ds:
+
+                    # Handle longitude wrapping
+                    if lon_min < lon_max:
+                        lon_selection = (ds['longitude'] >= lon_min) & (ds['longitude'] <= lon_max)
+                    else:
+                        lon_selection = ((ds['longitude'] >= lon_min) & (ds['longitude'] <= 360)) | (ds['longitude'] <= lon_max)
+
+                    lat_selection = (ds['latitude'] >= lat_min) & (ds['latitude'] <= lat_max)
+
+                    # Combine the selection masks
+                    selection = lat_selection & lon_selection
+
+                    # Check if selection is valid
+                    if selection.any():
+                        logger.info("%s included.", file)
+                    else:
+                        ds.close()
+                        continue
+
+                    # Drop data outside the region
+                    ds = ds.where(selection, drop=True)
+
+                    # Check if the filtered dataset has valid data
+                    if ds['latitude'].size == 0 or ds['longitude'].size == 0:
+                        logger.info("File %s excluded: empty dataset after region filtering.", file)
+                        ds.close()
+                        continue
+
+                # Add the dataset to the dictionary if it passed all filters
+                datasets_dict[current_key] = ds
+                current_key += 1
+
+        except Exception as e:
+            logger.warning("Error processing file %s: %s", file, e)
+            continue
+
+    return datasets_dict
+
+
+# =============================================================================
+# find_listdata
+# =============================================================================
+
+def find_listdata(matching_cycles, endpoint_url, bucket, pass_numbers, start_date, end_date, index_name="SSH"):
+    """
+    Find .nc files in S3 matching cycles, pass numbers, and months.
+
+    Parameters:
+        matching_cycles (list[int]): List of cycle numbers to search.
+        endpoint_url (str): URL of the S3 endpoint.
+        bucket (str): Full base folder path of the dataset, including the
+            's3://' scheme and bucket name (e.g. 's3://project-moi-swot-omip/GLO12V4').
+            Cycle folders are globbed as '{bucket}/cycle_{n}/**/*.nc', so a bare
+            bucket name is not enough.
+        pass_numbers (list[int]): List of allowed pass numbers.
+        start_date (str): Start date in format 'ddmmyyyy'.
+        end_date (str): End date in format 'ddmmyyyy'.
+
+    Returns:
+        list_files (list[str]): List of S3 keys that match the filters.
+    """
+    # Convert start/end dates to month integers
+    m1 = datetime.strptime(start_date, "%d%m%Y").month
+    m2 = datetime.strptime(end_date, "%d%m%Y").month
+
+    # Initialize S3 filesystem USING S3FS
+    fs = s3fs.S3FileSystem(anon=True, endpoint_url=endpoint_url)  # assumes AWS credentials are set in environment or ~/.aws/credentials
+    list_files = []
+
+    for cycle_number in matching_cycles:
+        # Construct the S3 folder path
+        s3_folder = f"{bucket}/cycle_{cycle_number}/"
+
+        # Recursively find all .nc files
+        all_files = fs.glob(s3_folder + "**/*.nc")  # ** for recursive search
+
+        for filename in all_files:
+            parsed = _parse_swot_filename(filename, index_name)
+            if parsed is None:
+                logger.warning("Skipping %s: unrecognized filename.", filename)
+                continue
+            pass_number, file_end_date = parsed
+            month = datetime.strptime(file_end_date, "%Y%m%d").month
+            if (month in range(m1, m2 + 1)) & (pass_number in pass_numbers):
+                logger.debug("%s", filename)
+                list_files.append(filename)
+
+    logger.info("%d files found", len(list_files))
+    return list_files
+
+
+# =============================================================================
+# find_listdata_local
+# =============================================================================
+
+def find_listdata_local(matching_cycles, folder, pass_numbers, start_date, end_date, index_name="SSH"):
+    """
+    Find local .nc files matching cycles, pass numbers, and months.
+    Local-filesystem twin of find_listdata: cycle folders are globbed as
+    '{folder}/cycle_{n}/*.nc'.
+
+    Parameters:
+        matching_cycles (list[int]): List of cycle numbers to search.
+        folder (str): Local folder containing the cycle_XXX subfolders.
+        pass_numbers (list[int]): List of allowed pass numbers.
+        start_date (str): Start date in format 'ddmmyyyy'.
+        end_date (str): End date in format 'ddmmyyyy'.
+
+    Returns:
+        list_files (list[str]): List of file paths that match the filters.
+    """
+    # Convert start/end dates to month integers
+    m1 = datetime.strptime(start_date, "%d%m%Y").month
+    m2 = datetime.strptime(end_date, "%d%m%Y").month
+
+    list_files = []
+
+    for cycle_number in matching_cycles:
+        # Recursively find all .nc files
+        all_files = glob.glob(folder + f"/cycle_{cycle_number}/*.nc")
+
+        for filename in all_files:
+            parsed = _parse_swot_filename(filename, index_name)
+            if parsed is None:
+                logger.warning("Skipping %s: unrecognized filename.", filename)
+                continue
+            pass_number, file_end_date = parsed
+            month = datetime.strptime(file_end_date, "%Y%m%d").month
+            if (month in range(m1, m2 + 1)) & (pass_number in pass_numbers):
+                logger.debug("%s", filename)
+                list_files.append(filename)
+
+    logger.info("%d files found", len(list_files))
+    return list_files
+
+
+# =============================================================================
+# normalize_longitude
+# =============================================================================
+
+def normalize_longitude(geometry):
+    """Normalize longitude coordinates to [-180, 180] range.
+
+    Points are returned as shapely Points; polygons are rebuilt with
+    normalized exterior and interior rings (holes are preserved — note that
+    assigning to Polygon.interiors, as done historically, is a no-op on
+    shapely 2). Other geometry types are returned unchanged.
+    """
+    if geometry.geom_type == 'Point':
+        x, y = geometry.x, geometry.y
+        x_norm = ((x + 180) % 360) - 180
+        return Point(x_norm, y)
+    elif hasattr(geometry, 'exterior'):
+        # For polygons, transform exterior and interior coordinates
+        def transform_coords(coords):
+            return [((lon + 180) % 360 - 180, lat) for lon, lat in coords]
+
+        exterior = geometry.exterior
+        coords = transform_coords(list(exterior.coords))
+        interiors = [transform_coords(list(interior.coords)) for interior in geometry.interiors]
+        return Polygon(coords, holes=interiors)
+    return geometry
+
+
+# =============================================================================
+# get_half_orbits_intersect
+# =============================================================================
+
+def get_half_orbits_intersect(bbox, GEOMETRIES_FILE):
+    """Get half orbits that intersect a bounding box.
+
+    Parameters
+    ----------
+    bbox:
+        the bounding box
+
+    Returns
+    -------
+     gpd.GeoDataFrame:
+        A Geopandas dataframe containing intersecting half orbits numbers and geometries
+    """
+    import geopandas as gpd  # deferred so that importing this module does not require geopandas
+
+    swath_geometries = gpd.read_file(GEOMETRIES_FILE)
+
+    bbox_polygon = geometry.box(*bbox)
+
+    def _filter_intersect(row, polygon):
+        half_orbit_polygon = row.geometry
+        return polygon.intersects(half_orbit_polygon)
+
+    select = swath_geometries.apply(_filter_intersect, polygon=bbox_polygon, axis=1)
+    return swath_geometries[select]
+
+
+# =============================================================================
+# swath_search
+# =============================================================================
+
+def swath_search(lsw, lNE, latsw, latNE, GEOMETRIES_FILE):
+    """Return the pass numbers of the half orbits intersecting a lat/lon box."""
+    lon_range = lsw, lNE
+    lat_range = latsw, latNE
+    bbox = [lon_range[0], lat_range[0], lon_range[1], lat_range[1]]
+    swath_geoms = get_half_orbits_intersect(bbox, GEOMETRIES_FILE)
+    half_orbits = list(swath_geoms['pass_number'])
+
+    return np.transpose(half_orbits)
+
+
+# =============================================================================
+# make_circular_axis
+# =============================================================================
+
+def make_circular_axis(lon_array):
+    """
+    Return a strictly-increasing longitude array in [0, 360).
+
+    Longitudes are taken modulo 360 and sorted. No pyinterp object is built
+    here (the name is kept for backwards compatibility with existing call
+    sites); pass the result to a pyinterp Axis with is_circle=False.
+    """
+    # Ensure all values in [0, 360)
+    lon = np.mod(lon_array, 360)
+
+    # Sort to make strictly increasing
+    sort_idx = np.argsort(lon)
+    lon_sorted = lon[sort_idx]
+
+    return lon_sorted
     
