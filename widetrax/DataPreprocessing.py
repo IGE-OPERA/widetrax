@@ -1,5 +1,6 @@
 import os
 import re
+import inspect
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -286,9 +287,92 @@ def count_observations(datasets, area, resolution):
 # =============================================================================
 
 
+def _gauss_seidel_inplace_api():
+    """
+    Detect the pyinterp.fill.gauss_seidel API generation.
+
+    pyinterp >= 2026 fills a plain float array IN PLACE and returns
+    ``(iterations, residual)`` with ``epsilon`` keyword-only; older releases
+    take a Grid2D and return ``(has_converged, filled_data)`` with ``epsilon``
+    positional-or-keyword.
+
+    Returns
+    ---------
+    bool
+        True for the pyinterp >= 2026 in-place flavour.
+    """
+    sig = inspect.signature(pyinterp.fill.gauss_seidel)
+    epsilon = sig.parameters.get("epsilon")
+    return epsilon is not None and epsilon.kind == inspect.Parameter.KEYWORD_ONLY
+
+
+def _gauss_seidel_fill(values, longitudes, latitudes,
+                       epsilon=1e-4, num_threads=16):
+    """
+    Gauss-Seidel NaN filling of one swath segment, on either pyinterp generation.
+
+    The x axis is built from the first-row longitudes taken modulo 360 and
+    sorted — strictly increasing, as pyinterp requires, and explicitly NOT
+    periodic, which is the right geometry for a single KaRIn swath (the
+    historic Axis on raw longitudes could be non-monotonic for wrapped
+    segments, and is_circle=True wrongly interpolates across the 0/360 seam).
+    The value columns are permuted to match the sorted axis and restored
+    afterwards, so the returned array stays aligned with the caller's
+    coordinates whatever the input ordering.
+
+    Parameters
+    ------------
+    values : np.ndarray
+        2D array (num_lines, num_pixels) with NaNs to fill.
+    longitudes, latitudes : np.ndarray
+        2D coordinate arrays of the swath segment.
+    epsilon : float, optional
+        Convergence threshold (used on the pyinterp >= 2026 path, matching the
+        historic engine default), default 1e-4.
+    num_threads : int, optional
+        passed to pyinterp, default 16.
+
+    Returns
+    ---------
+    has_converged : bool
+        True when the fill converged (pyinterp >= 2026: final residual <= epsilon).
+    filled_values : np.ndarray
+        Filled array, same column order as the input.
+    """
+    x_values = np.mod(longitudes[0, :], 360.0)
+    sort_idx = np.argsort(x_values)
+    x_sorted = x_values[sort_idx]
+    restore_idx = np.argsort(sort_idx)
+    sorted_values = np.asarray(values, dtype="f8")[:, sort_idx]
+    y_values = latitudes[:, 0]
+
+    if _gauss_seidel_inplace_api():
+        # pyinterp >= 2026: plain array, filled in place, (iterations, residual)
+        _iterations, residual = fill.gauss_seidel(
+            sorted_values,
+            epsilon=epsilon,
+            is_periodic=False,
+            num_threads=num_threads,
+        )
+        has_converged = bool(residual <= epsilon)
+        filled_values = sorted_values
+    else:
+        # legacy: Grid2D-backed (returns (has_converged, filled_data))
+        x_axis = pyinterp.core.Axis(x_sorted, is_circle=False)
+        y_axis = pyinterp.core.Axis(y_values, is_circle=False)
+        grid = pyinterp.Grid2D(y_axis, x_axis, sorted_values)
+        has_converged, filled_values = fill.gauss_seidel(grid, num_threads=num_threads)
+        has_converged = bool(has_converged)
+
+    return has_converged, filled_values[:, restore_idx]
+
+
 def fill_nan(datasets, varname: str = "ssha"):
     """
     Fills in missing values (NaN) in each xarray.Dataset using Gauss-Seidel method.
+
+    Works with both pyinterp generations: pyinterp >= 2026 (in-place
+    gauss_seidel on a plain array) and the legacy Grid2D-based API.
 
     Parameters
     ------------
@@ -327,10 +411,7 @@ def fill_nan(datasets, varname: str = "ssha"):
             nan_columns = np.all(np.isnan(values), axis=0)
 
             # fill NaN data
-            x_axis = pyinterp.core.Axis(longitudes[0, :], is_circle=True)
-            y_axis = pyinterp.core.Axis(latitudes[:, 0], is_circle=False)
-            grid = pyinterp.Grid2D(y_axis, x_axis, values)
-            _has_converged, filled_values = fill.gauss_seidel(grid, num_threads=16)
+            _has_converged, filled_values = _gauss_seidel_fill(values, longitudes, latitudes)
             has_converged &= _has_converged
 
             # Restore columns entirely NaN
