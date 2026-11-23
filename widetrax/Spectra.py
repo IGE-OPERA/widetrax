@@ -175,17 +175,17 @@ def psd_mean_and_freq(psd_dict, freqs_dict):
 # plot_psd
 # ============================================================================= 
 
-def plot_psd(ax, freqs, psds, unit, psd_labels, title=None, savefig=False, filename=None,plot_transparent=False):
+def plot_psd(ax, freqs, psds, unit, psd_labels, title=None, savefig=False, filename=None,plot_transparent=False,legend=True, loc_leg="best",bba_leg=(1,1),colors=None):
     """
     Plots the Power Spectral Density (PSD) on a logarithmic scale.
     
     The function plots the PSD on the given axes, `ax`. The plot is on a logarithmic scale 
     for both x and y axes. The function can handle one or two PSD arrays. If provided, 
-    it adds labels and a title to the plot. It also includes reference lines for $k^{-2}$ 
-    and $k^{-5}$ slopes.
-
+    it adds labels and a title to the plot. It also includes reference lines for $k^{-2}$, 
+    $k^{-3}$ and $k^{-5}$ slopes.
+    
     The function adds grid lines, legends, and adjusts axis labels and ticks for better readability.
-
+    
     If `freqs` or `psd1` are empty, the function prints an error message and returns 
     without plotting.
     
@@ -209,15 +209,28 @@ def plot_psd(ax, freqs, psds, unit, psd_labels, title=None, savefig=False, filen
         Name of the file to save the figure, default is 'figure.png'
     plot_transparent: bool
         True to display the figure with a transparent background, False otherwise
+    legend: bool, optional
+        True (default) to draw the legend.
+    loc_leg: str, optional
+        Location for the legend, default "best".
+    bba_leg: tuple, optional
+        bbox_to_anchor for the legend, default (1, 1).
+    colors: [str, ...] | None, optional
+        Line colors for the PSD curves (cycled if shorter than psds);
+        None (default) uses the matplotlib default cycle.
     """
     if isinstance(psds, np.ndarray):
         psds = [psds]
         psd_labels = [psd_labels]
     if psd_labels is None:
         psd_labels = [None] * len(psds)
+    if colors is None:
+        colors = [None] * len(psds)
+    else:
+        colors = list(colors) + [None] * (len(psds) - len(colors))
 
-    for psd, label in zip(psds, psd_labels):
-        ax.loglog(freqs, psd, label=label)
+    for psd, label, color in zip(psds, psd_labels, colors):
+        ax.loglog(freqs, psd, label=label,color=color)
 
     ax.set_ylim(1e-7, 1e2)
     ax.set_ylabel(f"PSD [${unit}/(cy/km)$]", fontsize=8, fontweight="bold", color="black")
@@ -229,12 +242,14 @@ def plot_psd(ax, freqs, psds, unit, psd_labels, title=None, savefig=False, filen
     # filters out zero frequencies
     non_zero_freqs = freqs[freqs != 0]
 
-    # k^-2 & k^-5
+    # k^-2, k^-3 & k^-5
     k_2 = non_zero_freqs ** -2 * (psds[0][0] / (non_zero_freqs[0] ** -2))  # Scale according to the first PSD value
+    k_3 = non_zero_freqs ** -3 * (psds[0][0] / (non_zero_freqs[0] ** -3))
     k_5 = non_zero_freqs ** -5 * (psds[0][0] / (non_zero_freqs[0] ** -5))
 
-    ax.loglog(non_zero_freqs, k_2*30, "k--", label="$k^{-2}$")  # 30 to fix the line
-    ax.loglog(non_zero_freqs, k_5*1e6, "b--", label="$k^{-5}$")  # 1e6 to fix the line
+    ax.loglog(non_zero_freqs, k_2*0.1, color="black",linestyle="--", label="$k^{-2}$")  # 0.1 to fix the line
+    ax.loglog(non_zero_freqs, k_3*1, color="dimgray",linestyle="--", label="$k^{-3}$")  # 1 to fix the line
+    ax.loglog(non_zero_freqs, k_5*10, color="darkgray",linestyle="--", label="$k^{-5}$")  # 10 to fix the line
 
     ax2 = ax.secondary_xaxis("bottom", functions=(lambda x: 1 / x, lambda x: 1 / x))
     ax2.set_xlabel("Wave-length [$km$]", fontsize=8, fontweight="bold", color="black")
@@ -243,7 +258,8 @@ def plot_psd(ax, freqs, psds, unit, psd_labels, title=None, savefig=False, filen
     ax2.set_xticks(wavelength_ticks)
     ax2.set_xticklabels(wavelength_ticks)
     ax.grid(True, which="both")
-    ax.legend()
+    if legend==True:
+         ax.legend(loc=loc_leg, bbox_to_anchor=bba_leg)
 
     # Set the title if provided
     if title:
